@@ -1,0 +1,29 @@
+market: fi2010
+model: logistic
+
+data:
+  fi2010_variant: Zscore
+  feature_set: raw40
+  label_rule: smoothed
+  horizon_k: 10
+  window_len: 1
+  standardize: true
+
+model_params:
+  C: 1.0
+  max_iter: 1000
+
+imbalance:
+  strategy: class_weight
+
+training:
+  seeds: [0, 1, 2, 3, 4]
+  epochs_max: 50
+  patience: 5
+  batch_size: 128
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine
+  grad_clip: 1.0
+
+output_dir: results/fi2010_raw40_smoothed_logistic/

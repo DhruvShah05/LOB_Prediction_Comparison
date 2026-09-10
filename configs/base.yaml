@@ -1,12 +1,38 @@
-market: null
-model: null
+# ──────────────────────────────────────────────────────────────────────────────
+# base.yaml — Default settings for all experiments (Change 6)
+# ──────────────────────────────────────────────────────────────────────────────
 
 data:
+  market: crypto                     # fi2010 | crypto
+  symbol: BTCUSDT                    # crypto only
+  start_ts: null                     # ISO UTC; null = use all data
+  end_ts: null
+  fi2010_variant: Zscore             # DecPre | Zscore (recommended: DecPre)
+  feature_set: raw40                 # raw40 | raw40_eng
+  label_rule: smoothed               # point_return | smoothed
+  horizon_events: 40                 # prediction horizon in events
+  threshold_mode: quantile           # fixed | quantile | std_mult
+  threshold_param: 0.0001            # α for fixed, c for std_mult, ignored for quantile
+  window_len: 100                    # 1 for trees/logistic, 100 for temporal models
+  split:
+    train: 0.70
+    val: 0.15
+    test: 0.15
+  gap: auto                          # auto = max(horizon, window_len)
   standardize: true
+  log_volume: true
 
-imbalance:
-  strategy: class_weight
-  focal_gamma: 2.0
+model_params: {}                     # Must be set per model; nulls are an error
 
 training:
   seeds: [0, 1, 2, 3, 4]
+  epochs_max: 50
+  patience: 5
+  batch_size: 128
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  dropout: 0.1
+  scheduler: cosine                  # cosine | plateau
+  grad_clip: 1.0
+
+imbalance: class_weight              # class_weight | focal_loss | none

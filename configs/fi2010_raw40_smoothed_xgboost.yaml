@@ -1,0 +1,36 @@
+market: fi2010
+model: xgboost
+
+data:
+  fi2010_variant: Zscore
+  feature_set: raw40
+  label_rule: smoothed
+  horizon_k: 10
+  window_len: 1
+  standardize: true
+
+model_params:
+  n_estimators: 500
+  max_depth: 6
+  learning_rate: 0.1
+  subsample: 0.8
+  colsample_bytree: 0.8
+  min_child_weight: 1
+  reg_lambda: 1.0
+  reg_alpha: 0.0
+  early_stopping_rounds: 50
+
+imbalance:
+  strategy: class_weight
+
+training:
+  seeds: [0, 1, 2, 3, 4]
+  epochs_max: 50
+  patience: 5
+  batch_size: 128
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine
+  grad_clip: 1.0
+
+output_dir: results/fi2010_raw40_smoothed_xgboost/

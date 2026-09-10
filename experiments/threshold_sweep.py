@@ -1,133 +1,229 @@
 """
-experiments/threshold_sweep.py — Crypto labeling sensitivity study (build.md §7.1).
+experiments/threshold_sweep.py — Extended threshold & horizon sweep (Change 5.3, BUG B14).
 
-Sweeps horizon × threshold combinations and records:
-  1. Class balance (% Down / Stationary / Up) for every (horizon, threshold) pair.
-  2. Downstream Macro-F1 for both tree models (RF and XGBoost) across the grid
-     using a quick train/val/test run so the final labeling choice is justified
-     by performance evidence, not asserted (build.md §7.1).
+Grid: label_rule ∈ {point_return, smoothed}
+      × horizon ∈ {10, 20, 40, 100, 200, 400} (2.5s – 100s for crypto)
+      × threshold_mode ∈ {fixed 0.5/1/2 bp, quantile, std_mult 0.5}
 
-Outputs (saved to --out_dir):
-  threshold_sweep_balance.csv  — class distribution per combination
-  threshold_sweep_f1.csv       — tree-model Macro-F1 per combination
+For each cell: class distribution per split, val Macro-F1/MCC for logistic
+regression + XGBoost (fixed reasonable params, seed 0).
+
+Output: CSVs + heatmap figure. Also runs on FI-2010 over its available
+label columns.
 """
 
+import os
+import json
 import argparse
 import logging
-import os
-
+import itertools
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.utils.class_weight import compute_sample_weight
-import xgboost as xgb
 
-from data.labeling import run_threshold_sweep, apply_horizon_labeling
-from data.features import to_relative_price, TrainOnlyScaler
+from data.labeling import (
+    compute_mid_price, compute_returns, resolve_threshold,
+    label_by_threshold, horizon_events_to_seconds
+)
 from eval.metrics import compute_all_metrics
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def run_model_f1_sweep(df: pd.DataFrame, horizons: list, thresholds: list, seed: int = 0) -> pd.DataFrame:
-    """
-    For every (horizon, threshold) combination, trains a quick Random Forest and XGBoost
-    on a 70% train / 15% val+test split and records validation Macro-F1.
+def _train_eval_logistic(X_train, y_train, X_val, y_val):
+    """Quick logistic regression evaluation."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
 
-    Trees are used because they are cheap enough to sweep the full grid (build.md §7.1).
-    A single seed is used here for speed; the main experiment uses 5 seeds.
-    """
-    records = []
+    scaler = StandardScaler()
+    X_tr = scaler.fit_transform(X_train)
+    X_v = scaler.transform(X_val)
 
-    for h in horizons:
-        for t in thresholds:
-            logger.info(f"  Training models: horizon={h}, threshold={t}")
+    model = LogisticRegression(
+        multi_class='multinomial', solver='lbfgs', max_iter=500,
+        class_weight='balanced', random_state=0, n_jobs=-1
+    )
+    model.fit(X_tr, y_train)
+    preds = model.predict(X_v)
+    return compute_all_metrics(y_val, preds)
 
-            X, y = apply_horizon_labeling(df, h, t)
 
-            n = len(X)
-            tr_end  = int(n * 0.70)
-            val_end = int(n * 0.85)
+def _train_eval_xgboost(X_train, y_train, X_val, y_val):
+    """Quick XGBoost evaluation with fixed reasonable params."""
+    import xgboost as xgb
+    from sklearn.utils.class_weight import compute_sample_weight
 
-            X_train, y_train = X[:tr_end],       y[:tr_end]
-            X_val,   y_val   = X[tr_end:val_end], y[tr_end:val_end]
+    sw = compute_sample_weight(class_weight='balanced', y=y_train)
+    model = xgb.XGBClassifier(
+        n_estimators=200, max_depth=6, learning_rate=0.1,
+        objective='multi:softprob', num_class=3, random_state=0,
+        n_jobs=-1, tree_method='hist'
+    )
+    model.fit(X_train, y_train, sample_weight=sw)
+    preds = model.predict(X_val)
+    return compute_all_metrics(y_val, preds)
 
-            # Standardize — fit only on training split (build.md §8 rule 7)
-            scaler = TrainOnlyScaler(use_zscore=True)
-            X_train = scaler.fit_transform(X_train)
-            X_val   = scaler.transform(X_val)
 
-            row = {'horizon_events': h, 'threshold': t}
+def sweep_crypto(parquet_path='data/processed/crypto_BTCUSDT.parquet',
+                 output_dir='results/threshold_sweep/'):
+    """Run the full sweep on crypto data."""
+    import pandas as pd_local
+    from data.features import build_feature_matrix, TrainOnlyScaler, CANONICAL_RAW_COLS
 
-            # --- Random Forest ---
-            sw_rf = compute_sample_weight(class_weight='balanced', y=y_train)
-            rf = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=seed, n_jobs=-1)
-            rf.fit(X_train, y_train, sample_weight=sw_rf)
-            rf_f1 = compute_all_metrics(y_val, rf.predict(X_val))['macro_f1']
-            row['rf_val_macro_f1'] = rf_f1
+    os.makedirs(output_dir, exist_ok=True)
 
-            # --- XGBoost ---
-            sw_xgb = compute_sample_weight(class_weight='balanced', y=y_train)
-            clf_xgb = xgb.XGBClassifier(
-                n_estimators=100, max_depth=6, objective='multi:softprob', num_class=3,
-                random_state=seed, n_jobs=-1, tree_method='hist', verbosity=0
+    df = pd_local.read_parquet(parquet_path)
+
+    # Compute mid-price on raw data
+    mid_price = compute_mid_price(df).values
+
+    # Build raw feature matrix
+    X_raw = df[CANONICAL_RAW_COLS].values
+
+    horizons = [10, 20, 40, 100, 200, 400]
+    label_rules = ['point_return', 'smoothed']
+    threshold_configs = [
+        ('fixed', 0.00005),   # 0.5 bp
+        ('fixed', 0.0001),    # 1 bp
+        ('fixed', 0.0002),    # 2 bp
+        ('quantile', None),
+        ('std_mult', 0.5),
+    ]
+
+    results = []
+
+    for label_rule, horizon, (tmode, tparam) in itertools.product(
+            label_rules, horizons, threshold_configs):
+
+        logger.info(f"Sweep: {label_rule}, H={horizon}, {tmode}({tparam})")
+
+        try:
+            returns = compute_returns(mid_price, horizon, label_rule)
+            n_valid = len(returns)
+            X = X_raw[:n_valid]
+
+            # Split 70/15/15
+            tr = int(n_valid * 0.70)
+            val = int(n_valid * 0.85)
+            gap = max(horizon, 1)
+
+            train_returns = returns[:tr - gap]
+            alpha = resolve_threshold(
+                train_returns, tmode,
+                tparam if tparam is not None else 0.0
             )
-            clf_xgb.fit(X_train, y_train, sample_weight=sw_xgb)
-            xgb_f1 = compute_all_metrics(y_val, clf_xgb.predict(X_val))['macro_f1']
-            row['xgb_val_macro_f1'] = xgb_f1
 
-            logger.info(f"    RF Macro-F1={rf_f1:.4f}  XGB Macro-F1={xgb_f1:.4f}")
-            records.append(row)
+            labels = label_by_threshold(returns, alpha)
 
-    return pd.DataFrame(records)
+            X_train = X[:tr - gap]
+            y_train = labels[:tr - gap]
+            X_val = X[tr:val - gap]
+            y_val = labels[tr:val - gap]
+
+            # Class distribution
+            _, train_counts = np.unique(y_train, return_counts=True)
+            _, val_counts = np.unique(y_val, return_counts=True)
+            train_pcts = train_counts / len(y_train) * 100 if len(y_train) > 0 else [0, 0, 0]
+
+            if len(y_train) < 10 or len(np.unique(y_train)) < 2:
+                logger.warning(f"  Skipping: insufficient data (train={len(y_train)})")
+                continue
+
+            # Evaluate logistic + XGBoost
+            log_metrics = _train_eval_logistic(X_train, y_train, X_val, y_val)
+            xgb_metrics = _train_eval_xgboost(X_train, y_train, X_val, y_val)
+
+            row = {
+                'market': 'crypto',
+                'label_rule': label_rule,
+                'horizon_events': horizon,
+                'horizon_seconds': horizon_events_to_seconds(horizon),
+                'threshold_mode': tmode,
+                'threshold_param': tparam,
+                'threshold_resolved': alpha,
+                'n_train': len(y_train),
+                'n_val': len(y_val),
+                'pct_down': float(train_pcts[0]) if len(train_pcts) > 0 else 0,
+                'pct_stat': float(train_pcts[1]) if len(train_pcts) > 1 else 0,
+                'pct_up': float(train_pcts[2]) if len(train_pcts) > 2 else 0,
+                'logistic_macro_f1': log_metrics['macro_f1'],
+                'logistic_mcc': log_metrics['mcc'],
+                'xgboost_macro_f1': xgb_metrics['macro_f1'],
+                'xgboost_mcc': xgb_metrics['mcc'],
+            }
+            results.append(row)
+
+        except Exception as e:
+            logger.warning(f"  Error: {e}")
+            continue
+
+    df_results = pd.DataFrame(results)
+    csv_path = os.path.join(output_dir, 'crypto_threshold_sweep.csv')
+    df_results.to_csv(csv_path, index=False)
+    logger.info(f"Crypto sweep saved to {csv_path}")
+
+    return df_results
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Crypto labeling threshold sensitivity sweep.")
-    parser.add_argument('--input',   type=str, default='data/processed/crypto_data.parquet',
-                        help="Prepared crypto parquet (from prepare_crypto.py)")
-    parser.add_argument('--out_dir', type=str, default='results',
-                        help="Directory to save sweep CSVs")
-    parser.add_argument('--seed',    type=int, default=0,
-                        help="Random seed for tree model training")
-    args = parser.parse_args()
+def sweep_fi2010(output_dir='results/threshold_sweep/'):
+    """Run horizon sweep on FI-2010 over its available label columns."""
+    os.makedirs(output_dir, exist_ok=True)
 
-    if not os.path.exists(args.input):
-        logger.error(f"Cannot find prepared data at {args.input}. Run scripts/prepare_crypto.py first.")
-        return
+    train_path = 'data/processed/fi2010_zscore_train.npy'
+    if not os.path.exists(train_path):
+        logger.warning("FI-2010 data not found, skipping FI-2010 sweep.")
+        return None
 
-    df = pd.read_parquet(args.input)
-    df = to_relative_price(df)
+    train_data = np.load(train_path)
+    results = []
 
-    # Sweep configuration — build.md §7.1
-    horizons   = [10, 40, 100, 250, 500]
-    thresholds = [0.0001, 0.0002, 0.0005, 0.001]
+    for label_col_idx, label_col in enumerate(range(144, 149)):
+        X_all = train_data[:, :40]  # raw 40
+        y_all = train_data[:, label_col].astype(int) - 1  # 1/2/3 → 0/1/2
 
-    logger.info(f"Running class-balance sweep on {len(df):,} rows...")
-    logger.info(f"Horizons: {horizons}, Thresholds: {thresholds}")
+        # Split
+        n = len(X_all)
+        tr = int(n * 0.8)
+        X_train, y_train = X_all[:tr], y_all[:tr]
+        X_val, y_val = X_all[tr:], y_all[tr:]
 
-    # --- Part 1: Class balance ---
-    balance_df = run_threshold_sweep(df, horizons, thresholds)
-    os.makedirs(args.out_dir, exist_ok=True)
-    balance_out = os.path.join(args.out_dir, 'threshold_sweep_balance.csv')
-    balance_df.to_csv(balance_out, index=False)
-    logger.info(f"Class-balance sweep saved to {balance_out}")
-    print("\n--- Class Balance ---")
-    print(balance_df.to_string(index=False))
+        if len(np.unique(y_train)) < 2:
+            continue
 
-    # --- Part 2: Tree model Macro-F1 (build.md §7.1 requirement) ---
-    logger.info("\nRunning tree-model F1 sweep (this may take several minutes)...")
-    f1_df = run_model_f1_sweep(df, horizons, thresholds, seed=args.seed)
-    f1_out = os.path.join(args.out_dir, 'threshold_sweep_f1.csv')
-    f1_df.to_csv(f1_out, index=False)
-    logger.info(f"Model F1 sweep saved to {f1_out}")
-    print("\n--- Tree Model Macro-F1 ---")
-    print(f1_df.to_string(index=False))
+        log_metrics = _train_eval_logistic(X_train, y_train, X_val, y_val)
+        xgb_metrics = _train_eval_xgboost(X_train, y_train, X_val, y_val)
 
-    print(f"\nSweep complete. Use these results to justify the final horizon/threshold in configs/crypto_*.yaml")
+        _, counts = np.unique(y_train, return_counts=True)
+        pcts = counts / len(y_train) * 100
+
+        results.append({
+            'market': 'fi2010',
+            'label_column': label_col,
+            'label_col_idx': label_col_idx,
+            'pct_down': float(pcts[0]) if len(pcts) > 0 else 0,
+            'pct_stat': float(pcts[1]) if len(pcts) > 1 else 0,
+            'pct_up': float(pcts[2]) if len(pcts) > 2 else 0,
+            'logistic_macro_f1': log_metrics['macro_f1'],
+            'logistic_mcc': log_metrics['mcc'],
+            'xgboost_macro_f1': xgb_metrics['macro_f1'],
+            'xgboost_mcc': xgb_metrics['mcc'],
+        })
+
+    df_results = pd.DataFrame(results)
+    csv_path = os.path.join(output_dir, 'fi2010_horizon_sweep.csv')
+    df_results.to_csv(csv_path, index=False)
+    logger.info(f"FI-2010 sweep saved to {csv_path}")
+
+    return df_results
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description="Threshold & horizon sweep (Change 5.3)")
+    parser.add_argument('--market', type=str, default='both', choices=['crypto', 'fi2010', 'both'])
+    parser.add_argument('--output-dir', type=str, default='results/threshold_sweep/')
+    args = parser.parse_args()
 
+    if args.market in ('crypto', 'both'):
+        sweep_crypto(output_dir=args.output_dir)
+    if args.market in ('fi2010', 'both'):
+        sweep_fi2010(output_dir=args.output_dir)

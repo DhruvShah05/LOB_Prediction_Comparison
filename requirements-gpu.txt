@@ -1,0 +1,14 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# GPU dependencies — install BEFORE pip install -r requirements.txt
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# For CUDA 12.1:
+#   pip install torch==2.2.1 --index-url https://download.pytorch.org/whl/cu121
+#
+# For Apple Silicon (MPS):
+#   pip install torch==2.2.1  (default wheel includes MPS support)
+#
+# Then install the rest:
+#   pip install -r requirements.txt
+
+torch==2.2.1

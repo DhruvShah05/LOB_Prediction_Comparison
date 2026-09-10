@@ -1,0 +1,31 @@
+market: crypto
+model: xgboost
+
+data:
+  symbol: BTCUSDT
+  feature_set: raw40
+  label_rule: smoothed
+  horizon_events: 40
+  threshold_mode: quantile
+  window_len: 1
+  standardize: true
+
+model_params:
+  # Set by train/tune.py — no nulls allowed
+  n_estimators: 500
+  max_depth: 6
+  learning_rate: 0.1
+  subsample: 0.8
+  colsample_bytree: 0.8
+  min_child_weight: 1
+  reg_lambda: 1.0
+  reg_alpha: 0.0
+  early_stopping_rounds: 50
+
+imbalance:
+  strategy: class_weight
+
+training:
+  seeds: [0, 1, 2, 3, 4]
+
+output_dir: results/crypto_raw40_smoothed_xgboost/

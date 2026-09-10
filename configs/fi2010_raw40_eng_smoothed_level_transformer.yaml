@@ -1,0 +1,27 @@
+market: fi2010
+model: level_transformer
+
+data:
+  fi2010_variant: Zscore
+  horizon_k: 10
+  feature_set: raw40_eng
+  label_rule: smoothed
+  window_len: 100
+  standardize: true
+
+model_params: {}
+
+imbalance:
+  strategy: class_weight
+
+training:
+  seeds: [0, 1, 2, 3, 4]
+  epochs_max: 50
+  patience: 5
+  batch_size: 128
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine
+  grad_clip: 1.0
+
+output_dir: results/fi2010_raw40_eng_smoothed_level_transformer/

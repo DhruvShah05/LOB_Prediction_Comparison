@@ -1,0 +1,32 @@
+market: crypto
+model: random_forest
+
+data:
+  symbol: BTCUSDT
+  feature_set: raw40
+  label_rule: smoothed
+  horizon_events: 40
+  threshold_mode: quantile
+  window_len: 1
+  standardize: true
+
+model_params:
+  n_estimators: 500
+  max_depth: null
+  min_samples_leaf: 1
+  max_features: sqrt
+
+imbalance:
+  strategy: class_weight
+
+training:
+  seeds: [0, 1, 2, 3, 4]
+  epochs_max: 50
+  patience: 5
+  batch_size: 128
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine
+  grad_clip: 1.0
+
+output_dir: results/crypto_raw40_smoothed_random_forest/

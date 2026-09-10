@@ -6,7 +6,7 @@
 pandas==2.2.1
 numpy==1.26.4
 pyarrow==15.0.0          # required for parquet I/O (crypto dataset)
-huggingface_hub>=1.29.0  # required for downloading datasets from Hugging Face buckets
+huggingface_hub==1.29.0  # pinned for reproducibility; required for downloading datasets from Hugging Face buckets
 
 # Tree models
 scikit-learn==1.4.1.post1

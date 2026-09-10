@@ -1,0 +1,33 @@
+market: crypto
+model: deeplob_attention
+
+data:
+  symbol: BTCUSDT
+  feature_set: raw40
+  label_rule: smoothed
+  horizon_events: 40
+  threshold_mode: quantile
+  window_len: 100
+  standardize: true
+
+model_params:
+  d_model: 64
+  nhead: 4
+  num_layers: 2
+  dropout: 0.1
+  pooling: mean
+
+imbalance:
+  strategy: class_weight
+
+training:
+  seeds: [0, 1, 2, 3, 4]
+  epochs_max: 50
+  patience: 5
+  batch_size: 128
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  scheduler: cosine
+  grad_clip: 1.0
+
+output_dir: results/crypto_raw40_smoothed_deeplob_attention/

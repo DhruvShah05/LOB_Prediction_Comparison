@@ -1,91 +1,148 @@
+"""
+models/structured_transformer.py — LevelTransformer (Change 2.3, BUG B3/B4, R1).
+
+Tokenization on the canonical raw-40 layout: one token per **level** =
+4 values (ask_p_i, ask_v_i, bid_p_i, bid_v_i) plus that level's
+spread/mid/imbalance if the engineered set is on.
+
+Two-stage encoder (cleaner to ablate):
+  Stage 1 (Level attention):  Within each snapshot, attend across 10 levels.
+  Stage 2 (Temporal attention): Across time, attend over pooled snapshot vectors.
+
+Pooling options: {mean, cls, attention}
+Exposed: num_layers, d_model, nhead, dropout — all configurable for ablation.
+"""
+
 import torch
 import torch.nn as nn
+import math
+
 from .transformer import PositionalEncoding
 
-class StructuredTransformer(nn.Module):
+
+class LevelTransformer(nn.Module):
     """
-    Structured Transformer.
-    Must support independent ablation flags:
-    - token_mode: 'flat' (scalars) vs 'grouped' (level-grouped tokens, e.g., price/vol pairs)
-    - pooling_mode: 'mean', 'cls', or 'attention'
+    Two-stage Level Transformer for LOB prediction.
+
+    Stage 1: Level attention — one token per level (10 levels), within each snapshot.
+    Stage 2: Temporal attention — one token per snapshot, across time.
+
+    Input: (batch, T, 40) — T snapshots of 40 features in canonical layout.
     """
-    def __init__(self, in_features: int, token_mode: str = 'grouped', pooling_mode: str = 'attention', 
-                 d_model: int = 64, nhead: int = 4, num_layers: int = 2, num_classes: int = 3):
+
+    def __init__(self, in_features: int = 40, d_model: int = 64, nhead: int = 4,
+                 num_layers_level: int = 2, num_layers_temporal: int = 2,
+                 num_classes: int = 3, dropout: float = 0.1,
+                 pooling: str = 'mean', n_levels: int = 10,
+                 features_per_level: int = 4):
         super().__init__()
-        
-        self.token_mode = token_mode
-        self.pooling_mode = pooling_mode
-        
-        if self.token_mode == 'grouped':
-            # Assuming pairs (price, volume) for Crypto (40 features -> 20 pairs)
-            # For FI-2010, the first 40 features are the raw LOB, the rest are derivations.
-            # To keep it generic/simple as specified, we group adjacent features in pairs.
-            self.group_size = 2
-            self.seq_len = in_features // self.group_size
-            self.token_proj = nn.Linear(self.group_size, d_model)
-        else: # 'flat'
-            self.seq_len = in_features
-            self.token_proj = nn.Linear(1, d_model)
-            
-        self.pos_encoder = PositionalEncoding(d_model, max_len=self.seq_len + (1 if pooling_mode == 'cls' else 0))
-        
-        if self.pooling_mode == 'cls':
+        self.n_levels = n_levels
+        self.features_per_level = features_per_level
+        self.pooling = pooling
+        self.d_model = d_model
+
+        # Level token projection: (features_per_level,) → (d_model,)
+        self.level_proj = nn.Linear(features_per_level, d_model)
+
+        # Level positional encoding (over levels 1..10)
+        self.level_pos = PositionalEncoding(d_model, max_len=n_levels + 1, dropout=dropout)
+
+        # Stage 1: Level attention
+        level_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, batch_first=True,
+            dim_feedforward=d_model * 4, dropout=dropout
+        )
+        self.level_encoder = nn.TransformerEncoder(level_encoder_layer,
+                                                    num_layers=num_layers_level)
+
+        # Temporal positional encoding (over time steps)
+        self.temporal_pos = PositionalEncoding(d_model, max_len=500, dropout=dropout)
+
+        # Stage 2: Temporal attention
+        temporal_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, batch_first=True,
+            dim_feedforward=d_model * 4, dropout=dropout
+        )
+        self.temporal_encoder = nn.TransformerEncoder(temporal_encoder_layer,
+                                                       num_layers=num_layers_temporal)
+
+        # Pooling
+        if pooling == 'cls':
             self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
-            
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, dim_feedforward=d_model*4)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        if self.pooling_mode == 'attention':
-            # Attention pooling: learned query vector attends to all sequence outputs
+        if pooling == 'attention':
             self.attn_pool_query = nn.Parameter(torch.randn(1, 1, d_model))
-            # Q: (batch, 1, d_model), K,V: (batch, seq_len, d_model)
-            self.attn_pool = nn.MultiheadAttention(embed_dim=d_model, num_heads=1, batch_first=True)
-            
+            self.attn_pool = nn.MultiheadAttention(embed_dim=d_model, num_heads=1,
+                                                    batch_first=True)
+
         self.fc = nn.Linear(d_model, num_classes)
-        
+
     def forward(self, x):
-        # x shape: (batch, in_features)
-        batch_size = x.size(0)
-        
-        if self.token_mode == 'grouped':
-            # (batch, seq_len, group_size)
-            x = x.view(batch_size, self.seq_len, self.group_size)
-        else:
-            # (batch, in_features, 1)
-            x = x.unsqueeze(-1)
-            
-        x = self.token_proj(x)
-        
-        if self.pooling_mode == 'cls':
+        """
+        x: (batch, T, 40) — windowed input with canonical layout
+           40 features = 10 levels × 4 (ask_p, ask_v, bid_p, bid_v)
+        """
+        batch_size, T, F = x.shape
+
+        # Reshape to per-level tokens: (batch * T, n_levels, features_per_level)
+        x = x.view(batch_size * T, self.n_levels, self.features_per_level)
+
+        # Project level tokens: (batch*T, 10, d_model)
+        x = self.level_proj(x)
+        x = self.level_pos(x)
+
+        # Stage 1: Level attention within each snapshot
+        x = self.level_encoder(x)  # (batch*T, 10, d_model)
+
+        # Pool levels within each snapshot → (batch*T, d_model)
+        snapshot_repr = x.mean(dim=1)  # mean over levels
+
+        # Reshape to temporal: (batch, T, d_model)
+        snapshot_repr = snapshot_repr.view(batch_size, T, self.d_model)
+
+        # Add temporal positional encoding
+        if self.pooling == 'cls':
             cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-            x = torch.cat((cls_tokens, x), dim=1)
-            
-        x = self.pos_encoder(x)
-        x = self.transformer_encoder(x)
-        
-        if self.pooling_mode == 'cls':
-            pooled = x[:, 0, :]
-        elif self.pooling_mode == 'attention':
+            snapshot_repr = torch.cat([cls_tokens, snapshot_repr], dim=1)
+
+        snapshot_repr = self.temporal_pos(snapshot_repr)
+
+        # Stage 2: Temporal attention
+        temporal_out = self.temporal_encoder(snapshot_repr)  # (batch, T', d_model)
+
+        # Final pooling
+        if self.pooling == 'cls':
+            pooled = temporal_out[:, 0, :]
+        elif self.pooling == 'attention':
             query = self.attn_pool_query.expand(batch_size, -1, -1)
-            # attn_output shape: (batch, 1, d_model)
-            pooled, _ = self.attn_pool(query, x, x)
+            pooled, _ = self.attn_pool(query, temporal_out, temporal_out)
             pooled = pooled.squeeze(1)
-        else: # 'mean'
-            pooled = x.mean(dim=1)
-            
+        else:  # 'mean'
+            pooled = temporal_out.mean(dim=1)
+
         logits = self.fc(pooled)
         return logits
 
+
 def build_model(config: dict) -> nn.Module:
-    market = config.get('market')
-    in_features = 144 if market == 'fi2010' else 40
-    
     model_params = config.get('model_params', {})
-    token_mode = model_params.get('token_mode', 'flat')
-    pooling_mode = model_params.get('pooling_mode', 'mean')
-    
-    return StructuredTransformer(
-        in_features=in_features, 
-        token_mode=token_mode, 
-        pooling_mode=pooling_mode
+
+    d_model = model_params.get('d_model', 64)
+    nhead = model_params.get('nhead', 4)
+    num_layers_level = model_params.get('num_layers_level', 2)
+    num_layers_temporal = model_params.get('num_layers_temporal', 2)
+    # Support legacy 'num_layers' as shorthand for both
+    if 'num_layers' in model_params:
+        num_layers_level = model_params['num_layers']
+        num_layers_temporal = model_params['num_layers']
+    dropout = model_params.get('dropout', 0.1)
+    pooling = model_params.get('pooling', 'mean')
+
+    return LevelTransformer(
+        in_features=40,
+        d_model=d_model,
+        nhead=nhead,
+        num_layers_level=num_layers_level,
+        num_layers_temporal=num_layers_temporal,
+        dropout=dropout,
+        pooling=pooling,
     )
